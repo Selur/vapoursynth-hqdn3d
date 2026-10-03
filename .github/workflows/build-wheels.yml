@@ -35,7 +35,9 @@ jobs:
           # Meson would otherwise pick MinGW g++ on the runner, whose DLL needs libstdc++/libgcc
           # at load time. Build with MSVC and link the runtime statically instead.
           CIBW_CONFIG_SETTINGS_WINDOWS: setup-args=--vsenv setup-args=-Db_vscrt=mt
-          CIBW_TEST_COMMAND: python -c "from vapoursynth import core; core.hqdn3d.Hqdn3d"
+          # The installed wheel is autoloaded, so the test needs no plugin path.
+          CIBW_TEST_REQUIRES: numpy
+          CIBW_TEST_COMMAND: python {project}/test/test_hqdn3d.py
 
       - name: Re-tag wheel as Python-independent
         shell: bash

@@ -1,5 +1,5 @@
 /*
-    HQDN3D 1.00 for Vapoursynth
+    HQDN3D 1.10 for Vapoursynth
 
     Copyright (C) 2003 Daniel Moreno <comac@comac.darktech.org>
     Avisynth port (C) 2005 Loren Merritt <lorenm@u.washington.edu>
@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <vector>
 
 #include <VapourSynth4.h>
 #include <VSHelper4.h>
@@ -38,8 +39,19 @@ typedef struct Hqdn3dData {
     double chromTmp;
     int restartLap;
 
-    int coefs[4][512*16];
-    unsigned int *prevFrame[3] = { nullptr, nullptr, nullptr };
+    // Pixels are processed as 24 bit fixed point numbers: an 8 bit sample
+    // with 16 fractional bits. Samples of other bit depths are shifted into
+    // that scale on load and back on store, so the filter core and the
+    // strength parameters are independent of the bit depth of the clip.
+    int inShift;   // 24 - bitsPerSample
+    int peak;      // (1 << bitsPerSample) - 1
+    // The coefficient tables are indexed by the pixel difference at a
+    // resolution of 1 / (1 << lutBits) of an 8 bit step. 4 keeps the
+    // original 8 bit tables; from 12 bit on one step equals one source LSB.
+    int lutBits;
+    int lutShift;  // 16 - lutBits
+    std::vector<int> coefs[4];
+    uint16_t *prevFrame[3] = { nullptr, nullptr, nullptr };
     unsigned int *prevLine[3] = { nullptr, nullptr, nullptr };
     bool process[3];
     int last_frame = -1; // the last frame returned by hqdn3d
@@ -61,17 +73,33 @@ VS_CC hqdn3dFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
 }
 
 static inline unsigned int
-LowPassMul(unsigned int pMul, unsigned int cMul, const int* coef){
-    static const unsigned int ROUND_CONVOLUTION = 0x10007FF;
-    static const unsigned int SHIFT_CONVOLUTION = 12;
-    int d = (static_cast<int>(pMul - cMul) + ROUND_CONVOLUTION) >> SHIFT_CONVOLUTION;
+LowPassMul(unsigned int pMul, unsigned int cMul, const int* coef, const int lutShift) {
+    // The 1 << 24 bias keeps the difference positive before the shift, the
+    // remainder rounds it to the nearest table entry. For lutShift == 12
+    // this is the original 0x10007FF.
+    const unsigned int roundConvolution = (1u << 24) + (1u << (lutShift - 1)) - 1;
+    int d = (static_cast<int>(pMul - cMul) + roundConvolution) >> lutShift;
     return cMul + coef[d];
 }
 
+static inline unsigned int
+loadPixel(const uint8_t sample, const int inShift, const int peak) {
+    (void)peak;
+    return static_cast<unsigned int>(sample) << inShift;
+}
+
+static inline unsigned int
+loadPixel(const uint16_t sample, const int inShift, const int peak) {
+    // Samples above the nominal range would index the coefficient tables out
+    // of bounds, so clamp them.
+    return static_cast<unsigned int>(std::min<int>(sample, peak)) << inShift;
+}
+
+template <typename PixelT>
 static void
 deNoise(
       const uint8_t * srcPlane
-    , unsigned int * prevPlane
+    , uint16_t * prevPlane
     , unsigned int * prevLine
     , uint8_t * tarPlane
     , const int frameWidth
@@ -82,25 +110,37 @@ deNoise(
     , const int *coefsVertical
     , const int *coefsTemporal
     , const bool isFirstFrame
+    , const int inShift
+    , const int peak
+    , const int lutShift
 ) {
     static const unsigned int ROUND_LINE  = 0x1000007F;
     static const unsigned int SHIFT_LINE  = 8;
-    static const unsigned int ROUND_PIXEL = 0x10007FFF;
-    static const unsigned int SHIFT_PIXEL = 16;
+    // Rounds like the original 0x10007FFF: ties go down.
+    const unsigned int roundPixel = (1u << (inShift - 1)) - 1;
+
+    const int srcPitch = srcStride / static_cast<int>(sizeof(PixelT));
+    const int tarPitch = tarStride / static_cast<int>(sizeof(PixelT));
 
     for (int row = 0; row < frameHeight; ++row) {
+        const PixelT *srcRow = reinterpret_cast<const PixelT *>(srcPlane) + row * srcPitch;
+        PixelT *tarRow = tarPlane
+            ? reinterpret_cast<PixelT *>(tarPlane) + row * tarPitch
+            : nullptr;
         /* gcc assume prevPixel might be used in an uninitialized way, but
          * it's not. So feel free to use any other value
          */
         unsigned int prevPixel = 0;
         for (int col = 0; col < frameWidth; ++col) {
+            const unsigned int curPixel = loadPixel(srcRow[col], inShift, peak);
             // Correlate current pixel with previous pixel
             prevPixel = col == 0
-                ? srcPlane[row * srcStride + col] << SHIFT_PIXEL
+                ? curPixel
                 : LowPassMul(
                       prevPixel
-                    , srcPlane[row * srcStride + col] << SHIFT_PIXEL
+                    , curPixel
                     , coefsHorizontal
+                    , lutShift
                 );
             // Correlate previous line with previous pixel
             prevLine[col] = row == 0
@@ -109,6 +149,7 @@ deNoise(
                       prevLine[col]
                     , prevPixel
                     , coefsVertical
+                    , lutShift
                 );
             unsigned int resPix;
             if (isFirstFrame) {
@@ -116,17 +157,19 @@ deNoise(
             } else {
                 // Correlate vertical result with previous result frame pixel
                 resPix = LowPassMul(
-                      prevPlane[row * frameWidth + col] << SHIFT_LINE
+                      static_cast<unsigned int>(prevPlane[row * frameWidth + col]) << SHIFT_LINE
                     , prevLine[col]
                     , coefsTemporal
+                    , lutShift
                 );
             }
 
+            // The temporal state keeps 16 bits: an 8 bit sample with 8
+            // fractional bits, independent of the clip's bit depth.
             prevPlane[row * frameWidth + col]
-                = ((resPix + ROUND_LINE) >> SHIFT_LINE) & 0xFFFF;
-            if (tarPlane)
-                tarPlane[row * tarStride + col]
-                    = (resPix + ROUND_PIXEL) >> SHIFT_PIXEL;
+                = static_cast<uint16_t>(((resPix + ROUND_LINE) >> SHIFT_LINE) & 0xFFFF);
+            if (tarRow)
+                tarRow[col] = static_cast<PixelT>((resPix + roundPixel) >> inShift);
         }
     }
 }
@@ -144,19 +187,26 @@ static void filterFrame(
         if (!usrData->process[plane])
             continue;
 
-        deNoise(
+        auto deNoiseFn = srcFrameFmt->bytesPerSample == 1
+            ? deNoise<uint8_t>
+            : deNoise<uint16_t>;
+
+        deNoiseFn(
               vsapi->getReadPtr(srcFrame, plane)
             , usrData->prevFrame[plane]
             , usrData->prevLine[plane]
             , newFrame ? vsapi->getWritePtr(newFrame, plane) : nullptr
             , vsapi->getFrameWidth(srcFrame, plane)
             , vsapi->getFrameHeight(srcFrame, plane)
-            , vsapi->getStride(srcFrame, plane)
-            , newFrame ? vsapi->getStride(newFrame, plane) : 0
-            , usrData->coefs[plane == 0 ? 0 : 2] // Y or U/V
-            , usrData->coefs[plane == 0 ? 0 : 2] // Y or U/V
-            , usrData->coefs[plane == 0 ? 1 : 3] // Y or U/V
+            , static_cast<int>(vsapi->getStride(srcFrame, plane))
+            , newFrame ? static_cast<int>(vsapi->getStride(newFrame, plane)) : 0
+            , usrData->coefs[plane == 0 ? 0 : 2].data() // Y or U/V
+            , usrData->coefs[plane == 0 ? 0 : 2].data() // Y or U/V
+            , usrData->coefs[plane == 0 ? 1 : 3].data() // Y or U/V
             , isFirstFrame
+            , usrData->inShift
+            , usrData->peak
+            , usrData->lutShift
         );
     }
 
@@ -317,13 +367,20 @@ static void VS_CC hqdn3dCreate(
 
     if (!vsh::isConstantVideoFormat(d.vi) ||
         d.vi->format.colorFamily == cfRGB ||
-        d.vi->format.bitsPerSample != 8 ||
-        d.vi->format.sampleType != stInteger) {
+        d.vi->format.sampleType != stInteger ||
+        d.vi->format.bitsPerSample < 8 ||
+        d.vi->format.bitsPerSample > 16) {
 
-        vsapi->mapSetError(out, "Hqdn3d: input clip must be 8 bit, not RGB, and it must have constant format and dimensions.");
+        vsapi->mapSetError(out, "Hqdn3d: input clip must be 8-16 bit integer, not RGB, and it must have constant format and dimensions.");
         vsapi->freeNode(d.clip);
         return;
     }
+
+    const int bitsPerSample = d.vi->format.bitsPerSample;
+    d.inShift  = 24 - bitsPerSample;
+    d.peak     = (1 << bitsPerSample) - 1;
+    d.lutBits  = std::max(4, bitsPerSample - 8);
+    d.lutShift = 16 - d.lutBits;
 
 
     d.lumSpac   = std::min(254.9, d.lumSpac);
@@ -331,7 +388,11 @@ static void VS_CC hqdn3dCreate(
     d.lumTmp    = std::min(254.9, d.lumTmp);
     d.chromTmp  = std::min(254.9, d.chromTmp);
 
-    // Calculate the coefficients
+    // Calculate the coefficients. The strengths are always on the 8 bit
+    // scale, the tables map a pixel difference (in 1 / lutSteps of an 8 bit
+    // step) to the correction in the 24 bit internal scale.
+    const int lutSteps  = 1 << d.lutBits;
+    const int lutCenter = 256 * lutSteps;
     for (auto const &cc : {
           std::make_pair(0, d.lumSpac)
         , std::make_pair(1, d.lumTmp)
@@ -339,10 +400,12 @@ static void VS_CC hqdn3dCreate(
         , std::make_pair(3, d.chromTmp)
     } ) {
         const double gamma = std::log(0.25) / std::log(1.0 - cc.second / 255.0 - 0.00001);
-        for (int i = -255 * 16; i < 256 * 16; ++i) {
-            const double simil = 1.0 - std::abs(i) / (16*255.0);
-            const double c = std::pow(simil, gamma) * 65536.0 * i / 16.0;
-            d.coefs[cc.first][16*256+i]
+        std::vector<int> &table = d.coefs[cc.first];
+        table.assign(512 * lutSteps, 0);
+        for (int i = -255 * lutSteps; i < 256 * lutSteps; ++i) {
+            const double simil = std::max(0.0, 1.0 - std::abs(i) / (lutSteps * 255.0));
+            const double c = std::pow(simil, gamma) * 65536.0 * i / lutSteps;
+            table[lutCenter + i]
                 = static_cast<int>(c < 0 ? c - 0.5 : c + 0.5);
         }
     }
@@ -361,7 +424,7 @@ static void VS_CC hqdn3dCreate(
             height >>= d.vi->format.subSamplingH;
         }
 
-        d.prevFrame[p] = (unsigned int *)malloc(width * height * sizeof(unsigned int));
+        d.prevFrame[p] = (uint16_t *)malloc(width * height * sizeof(uint16_t));
         d.prevLine[p] = (unsigned int *)malloc(width * sizeof(unsigned int));
     }
 
@@ -393,7 +456,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(
           "com.vapoursynth.hqdn3d"
         , "hqdn3d"
         , "HQDn3D port as used in avisynth/mplayer"
-        , VS_MAKE_VERSION(1, 0)
+        , VS_MAKE_VERSION(1, 1)
         , VAPOURSYNTH_API_VERSION
         , 0
         , plugin
