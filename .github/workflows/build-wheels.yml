@@ -1,0 +1,68 @@
+name: Build wheels
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows x64, os: windows-latest, archs: AMD64 }
+          - { name: Linux x86_64, os: ubuntu-latest, archs: x86_64 }
+          - { name: macOS arm64, os: macos-14, archs: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          # The plugin only uses the VapourSynth C API, so one interpreter is enough;
+          # the wheel is re-tagged to py3-none below.
+          CIBW_BUILD: cp312-*
+          CIBW_SKIP: '*-musllinux*'
+          CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: ''
+          # Meson would otherwise pick MinGW g++ on the runner, whose DLL needs libstdc++/libgcc
+          # at load time. Build with MSVC and link the runtime statically instead.
+          CIBW_CONFIG_SETTINGS_WINDOWS: setup-args=--vsenv setup-args=-Db_vscrt=mt
+          CIBW_TEST_COMMAND: python -c "from vapoursynth import core; core.hqdn3d.Hqdn3d"
+
+      - name: Re-tag wheel as Python-independent
+        shell: bash
+        run: |
+          python -m pip install wheel
+          python -m wheel tags --python-tag py3 --abi-tag none --remove wheelhouse/*.whl
+          ls wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  release:
+    name: GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
