@@ -58,14 +58,31 @@ Parameters:
         Default: max(2, int(1 + max(lum_tmp, chrom_tmp)))
 
 
+Installation
+============
+
+Prebuilt wheels for Windows x64, Linux x86_64 and macOS arm64 are
+attached to each `GitHub release
+<https://github.com/Selur/vapoursynth-hqdn3d/releases>`_::
+
+    pip install vapoursynth_hqdn3d-*.whl
+
+The plugin uses the VapourSynth API 4 (VapourSynth R55 or newer).
+
+
 Compilation
 ===========
 
+Meson and Ninja are required. The VapourSynth API 4 headers are
+bundled, a system installation of VapourSynth is optional.
+
 ::
 
-    ./autogen.sh
-    ./configure
-    make
+    meson setup build
+    ninja -C build
+
+On macOS the plugin is built as ``libhqdn3d.dylib``, which is the only
+extension VapourSynth autoloads there.
 
 
 License
