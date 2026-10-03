@@ -24,8 +24,18 @@ Usage
 
 Parameters:
     *clip*
-        A clip to process. It must have constant format and dimensions
-        and it must be 8 bit and not RGB.
+        A clip to process. It must have constant format and dimensions,
+        8 to 16 bit integer samples, and it must not be RGB. Gray and
+        YUV with any subsampling are supported.
+
+        The filter strengths below are always on the 8 bit scale,
+        independent of the bit depth of the clip: ``lum_spac=4`` removes
+        the same amount of noise from a 10 or 16 bit clip as from the
+        same picture in 8 bit, so scripts do not need to be changed when
+        switching the bit depth. Internally the samples are processed as
+        24 bit fixed point numbers; from 12 bit on the coefficient tables
+        resolve single source LSBs, so fine high bit depth noise is
+        filtered as well.
 
     *lum_spac*
         Luma spatial filter strength. Must be between 0 and 255.
@@ -68,6 +78,20 @@ attached to each `GitHub release
     pip install vapoursynth_hqdn3d-*.whl
 
 The plugin uses the VapourSynth API 4 (VapourSynth R55 or newer).
+
+
+Testing
+=======
+
+``test/test_hqdn3d.py`` runs the plugin on synthetic clips: it checks
+that 8 to 16 bit clips are filtered consistently, that out of range
+samples are handled and that unsupported formats are rejected. It needs
+the ``vapoursynth`` Python module and ``numpy``::
+
+    python3 test/test_hqdn3d.py build/libhqdn3d.so
+
+An older build of the plugin can be passed as second argument; the 8 bit
+output must then match it bit for bit.
 
 
 Compilation
