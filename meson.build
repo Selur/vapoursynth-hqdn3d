@@ -1,7 +1,7 @@
 project('hqdn3d', 'cpp',
   default_options : ['buildtype=release', 'b_ndebug=if-release', 'cpp_std=c++14'],
   meson_version : '>=0.51.0',
-  version : '1.1'
+  version : '1.1.1'
 )
 
 sources = ['src/hqdn3d.cpp']
